@@ -42,7 +42,10 @@ from deepagents_cli.sessions import (
     thread_exists,
 )
 from deepagents_cli.skills import execute_skills_command, setup_skills_parser
+from deepagents_cli.mcp.commands import execute_mcp_command, setup_mcp_parser
 from deepagents_cli.tools import fetch_url, http_request, web_search
+from deepagents_cli.mcp.integration import get_mcp_tools
+from deepagents_cli.mcp.manager import get_mcp_manager
 from deepagents_cli.ui import show_help
 
 
@@ -127,6 +130,8 @@ def parse_args() -> argparse.Namespace:
     # threads delete
     threads_delete = threads_sub.add_parser("delete", help="Delete a thread")
     threads_delete.add_argument("thread_id", help="Thread ID to delete")
+    # MCP command - setup delegated to MCP module
+    setup_mcp_parser(subparsers)
 
     # Default interactive mode
     parser.add_argument(
@@ -180,7 +185,6 @@ def parse_args() -> argparse.Namespace:
     )
     return parser.parse_args()
 
-
 async def run_textual_cli_async(
     assistant_id: str,
     *,
@@ -220,6 +224,23 @@ async def run_textual_cli_async(
         tools = [http_request, fetch_url]
         if settings.has_tavily:
             tools.append(web_search)
+
+        # Load configured MCP tools
+        from deepagents_cli.mcp.integration import get_mcp_tools_async
+
+        # Register all configured MCP servers first
+        mcp_manager = get_mcp_manager()
+        for server_name, server_config in settings.mcp_servers.items():
+            mcp_manager.register_config(server_name, server_config)
+
+        # Load tools from each configured MCP server
+        for server_name in settings.mcp_servers:
+            try:
+                mcp_tools = await get_mcp_tools_async(server_name)
+                tools.extend(mcp_tools)
+                console.print(f"[green]Loaded {len(mcp_tools)} tools from MCP server '{server_name}'[/green]")
+            except Exception as e:
+                console.print(f"[yellow]Warning: Failed to load MCP tools from '{server_name}': {e}[/yellow]")
 
         # Handle sandbox mode
         sandbox_backend = None
@@ -306,6 +327,8 @@ def cli_main() -> None:
                 asyncio.run(delete_thread_command(args.thread_id))
             else:
                 console.print("[yellow]Usage: deepagents threads <list|delete>[/yellow]")
+        elif args.command == "mcp":
+            execute_mcp_command(args)
         else:
             # Interactive mode - handle thread resume
             thread_id = None

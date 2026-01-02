@@ -84,6 +84,7 @@ SLASH_COMMANDS: list[tuple[str, str]] = [
     ("/exit", "Exit app"),
     ("/tokens", "Token usage"),
     ("/threads", "Show session info"),
+    ("/mcp", "mcp tools relates, sub commands list connect reconnect tools stop"),
     ("/version", "Show version"),
 ]
 """Built-in slash commands with descriptions."""

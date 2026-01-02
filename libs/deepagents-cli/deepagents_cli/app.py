@@ -18,6 +18,14 @@ from textual.events import MouseUp  # noqa: TC002 - used in type annotation
 from textual.widgets import Static  # noqa: TC002 - used at runtime
 
 from deepagents_cli.clipboard import copy_selection_to_clipboard
+from deepagents_cli.config import Settings
+from deepagents_cli.mcp.commands import (
+    _connect_mcp_server,
+    _list_mcp_servers,
+    _list_mcp_tools,
+    _reconnect_mcp_server,
+    _stop_mcp_server,
+)
 from deepagents_cli.textual_adapter import TextualUIAdapter, execute_task_textual
 from deepagents_cli.widgets.approval import ApprovalMenu
 from deepagents_cli.widgets.chat_input import ChatInput
@@ -39,13 +47,22 @@ if TYPE_CHECKING:
 
 
 class TextualTokenTracker:
-    """Token tracker that updates the status bar."""
+    """Token tracker that updates the status bar.
 
-    def __init__(self, update_callback: callable, hide_callback: callable | None = None) -> None:
-        """Initialize with callbacks to update the display."""
+    Can be used with or without callbacks for flexible integration.
+    """
+
+    def __init__(self, update_callback: callable | None = None, hide_callback: callable | None = None) -> None:
+        """Initialize with callbacks to update the display.
+
+        Args:
+            update_callback: Optional callback to update the display with token count
+            hide_callback: Optional callback to hide the token display
+        """
         self._update_callback = update_callback
         self._hide_callback = hide_callback
         self.current_context = 0
+        self.baseline = 0
 
     def add(self, total_tokens: int, _output_tokens: int = 0) -> None:
         """Update token count from a response.
@@ -55,12 +72,18 @@ class TextualTokenTracker:
             _output_tokens: Unused, kept for backwards compatibility
         """
         self.current_context = total_tokens
-        self._update_callback(self.current_context)
+        if self._update_callback:
+            self._update_callback(self.current_context)
 
     def reset(self) -> None:
-        """Reset token count."""
-        self.current_context = 0
-        self._update_callback(0)
+        """Reset token count to baseline."""
+        self.current_context = self.baseline
+        if self._update_callback:
+            self._update_callback(self.current_context)
+
+    def set_baseline(self) -> None:
+        """Set current token count as the new baseline."""
+        self.baseline = self.current_context
 
     def hide(self) -> None:
         """Hide the token display (e.g., during streaming)."""
@@ -69,7 +92,15 @@ class TextualTokenTracker:
 
     def show(self) -> None:
         """Show the token display with current value (e.g., after interrupt)."""
-        self._update_callback(self.current_context)
+        if self._update_callback:
+            self._update_callback(self.current_context)
+
+    def display_session(self) -> None:
+        """Display session token usage (for non-Textual mode)."""
+        from .config import console
+        console.print()
+        console.print(f"[dim]Current session tokens: {self.current_context}[/dim]")
+        console.print()
 
 
 class TextualSessionState:
@@ -405,6 +436,29 @@ class DeepAgentsApp(App):
         except OSError as e:
             await self._mount_message(ErrorMessage(str(e)))
 
+    async def _show_help_message(self) -> None:
+        """Display complete interactive command help information."""
+        help_lines = [
+            "Interactive Commands:",
+            "",
+            "  /help          Show this help message",
+            "  /clear         Clear screen and reset conversation",
+            "  /tokens        Show token usage for current session",
+            "  /version       Show deepagents version",
+            "  /threads       Show current session thread ID",
+            "  /mcp           MCP server management",
+            "    /mcp list                List all MCP servers",
+            "    /mcp connect <name>      Connect to an MCP server",
+            "    /mcp reconnect <name>    Reconnect to an MCP server",
+            "    /mcp tools <name>        List tools from an MCP server",
+            "    /mcp stop <name>         Stop an MCP server",
+            "  /quit, /exit, /q  Exit the session",
+            "",
+            "  !command        Run bash commands directly"
+        ]
+        for line in help_lines:
+            await self._mount_message(SystemMessage(line))
+
     async def _handle_command(self, command: str) -> None:
         """Handle a slash command.
 
@@ -417,9 +471,7 @@ class DeepAgentsApp(App):
             self.exit()
         elif cmd == "/help":
             await self._mount_message(UserMessage(command))
-            await self._mount_message(
-                SystemMessage("Commands: /quit, /clear, /tokens, /threads, /help")
-            )
+            await self._show_help_message()
 
         elif cmd == "/version":
             await self._mount_message(UserMessage(command))
@@ -459,9 +511,176 @@ class DeepAgentsApp(App):
                 await self._mount_message(SystemMessage(f"Current context: {formatted} tokens"))
             else:
                 await self._mount_message(SystemMessage("No token usage yet"))
+        elif cmd.startswith("/mcp"):
+            await self._mount_message(UserMessage(command))
+            await self._handle_mcp_command(command)
         else:
             await self._mount_message(UserMessage(command))
             await self._mount_message(SystemMessage(f"Unknown command: {cmd}"))
+
+    async def _handle_mcp_command(self, command: str) -> None:
+        """Handle /mcp command."""
+        parts = command.lower().strip().split()
+        if len(parts) < 2:
+            await self._show_mcp_help()
+            return
+
+        subcommand = parts[1]
+        settings = Settings.from_environment()
+
+        if subcommand == "list":
+            result = await self._execute_mcp_command(lambda: _list_mcp_servers(settings, return_structured=True))
+            await self._display_mcp_list(result)
+        elif subcommand == "connect":
+            if len(parts) < 3:
+                await self._mount_message(SystemMessage("Usage: /mcp connect <server_name>"))
+                return
+            server_name = parts[2]
+            result = await self._execute_mcp_command(lambda: _connect_mcp_server(server_name, settings, return_structured=True))
+            await self._display_mcp_connect_result(result)
+        elif subcommand == "reconnect":
+            if len(parts) < 3:
+                await self._mount_message(SystemMessage("Usage: /mcp reconnect <server_name>"))
+                return
+            server_name = parts[2]
+            result = await self._execute_mcp_command(lambda: _reconnect_mcp_server(server_name, settings, return_structured=True))
+            await self._display_mcp_connect_result(result)
+        elif subcommand == "tools":
+            if len(parts) < 3:
+                await self._mount_message(SystemMessage("Usage: /mcp tools <server_name>"))
+                return
+            server_name = parts[2]
+            result = await self._execute_mcp_command(lambda: _list_mcp_tools(server_name, settings, return_structured=True))
+            await self._display_mcp_tools(result)
+        elif subcommand == "stop":
+            if len(parts) < 3:
+                await self._mount_message(SystemMessage("Usage: /mcp stop <server_name>"))
+                return
+            server_name = parts[2]
+            result = await self._execute_mcp_command(lambda: _stop_mcp_server(server_name, settings, return_structured=True))
+            await self._display_mcp_stop_result(result)
+        else:
+            await self._mount_message(SystemMessage(f"Unknown MCP subcommand: {subcommand}"))
+            await self._show_mcp_help()
+
+    async def _execute_mcp_command(self, func) -> Any:
+        """Execute synchronous MCP command in background thread and return result."""
+        try:
+            result = await asyncio.to_thread(func)
+            return result
+        except Exception as e:
+            await self._mount_message(ErrorMessage(f"MCP command failed: {e}"))
+            raise
+
+    async def _display_mcp_list(self, result: dict) -> None:
+        """Display MCP server list to TUI."""
+        if result is None:
+            await self._mount_message(ErrorMessage("Failed to get MCP server list"))
+            return
+
+        if not result.get("servers"):
+            await self._mount_message(SystemMessage(result.get("message", "No MCP servers configured")))
+            return
+
+        # Display title
+        await self._mount_message(SystemMessage(result.get("message", "MCP Servers:")))
+
+        # Display each server
+        for server in result["servers"]:
+            status_icon = "●" if server["running"] else "○"
+            status_text = "running" if server["running"] else "stopped"
+            await self._mount_message(SystemMessage(
+                f"  {status_icon} {server['name']} ({server['type']}) - {status_text}"
+            ))
+            if server.get("command"):
+                await self._mount_message(SystemMessage(f"    Command: {server['command']}"))
+            if server.get("pid"):
+                await self._mount_message(SystemMessage(f"    PID: {server['pid']}"))
+
+    async def _display_mcp_connect_result(self, result: dict) -> None:
+        """Display MCP connection result to TUI."""
+        if result is None:
+            await self._mount_message(ErrorMessage("MCP connect failed"))
+            return
+
+        if result.get("success"):
+            if result.get("already_running"):
+                await self._mount_message(SystemMessage(
+                    f"{result.get('message')} (PID: {result.get('pid')})"
+                ))
+            else:
+                await self._mount_message(SystemMessage(
+                    f"{result.get('message')} (PID: {result.get('pid')})"
+                ))
+        else:
+            await self._mount_message(ErrorMessage(result.get("message", "MCP connect failed")))
+            if result.get("available_servers"):
+                await self._mount_message(SystemMessage(
+                    f"Available servers: {', '.join(result['available_servers'])}"
+                ))
+
+    async def _display_mcp_stop_result(self, result: dict) -> None:
+        """Display MCP stop result to TUI."""
+        if result is None:
+            await self._mount_message(ErrorMessage("MCP stop failed"))
+            return
+
+        if result.get("success"):
+            await self._mount_message(SystemMessage(result.get("message", "MCP server stopped")))
+        else:
+            await self._mount_message(ErrorMessage(result.get("message", "MCP stop failed")))
+            if result.get("available_servers"):
+                await self._mount_message(SystemMessage(
+                    f"Available servers: {', '.join(result['available_servers'])}"
+                ))
+
+    async def _display_mcp_tools(self, result: dict) -> None:
+        """Display MCP tools list to TUI."""
+        if result is None:
+            await self._mount_message(ErrorMessage("Failed to get MCP tools"))
+            return
+
+        if not result.get("success"):
+            await self._mount_message(ErrorMessage(result.get("message", "Failed to get MCP tools")))
+            if result.get("available_servers"):
+                await self._mount_message(SystemMessage(
+                    f"Available servers: {', '.join(result['available_servers'])}"
+                ))
+            return
+
+        # Display title
+        server_name = result.get("server_name", "unknown")
+        await self._mount_message(SystemMessage(f"MCP Tools from '{server_name}':"))
+
+        # Display each tool
+        tools = result.get("tools", [])
+        if not tools:
+            await self._mount_message(SystemMessage("No tools found"))
+            return
+
+        for tool in tools:
+            await self._mount_message(SystemMessage(f"  • {tool['name']}"))
+            if tool.get("description"):
+                await self._mount_message(SystemMessage(f"    {tool['description']}"))
+
+    async def _show_mcp_help(self) -> None:
+        """Display MCP command help information."""
+        help_lines = [
+            "MCP Server Management:",
+            "",
+            "  /mcp list                List all configured MCP servers",
+            "  /mcp connect <name>      Connect to an MCP server",
+            "  /mcp reconnect <name>    Reconnect to an MCP server",
+            "  /mcp tools <name>        List tools from an MCP server",
+            "  /mcp stop <name>         Stop a running MCP server",
+            "",
+            "Examples:",
+            "  /mcp list",
+            "  /mcp connect context7",
+            "  /mcp tools context7"
+        ]
+        for line in help_lines:
+            await self._mount_message(SystemMessage(line))
 
     async def _handle_user_message(self, message: str) -> None:
         """Handle a user message to send to the agent.
